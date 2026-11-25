@@ -1,0 +1,1145 @@
+for pair in \
+  "34085:SET_A_0X8525" \
+  "34358:SET_A_0X8636" \
+  "34631:SET_A_0X8747" \
+  "35450:SET_B_0X8A7A" \
+  "35723:SET_B_0X8B8B" \
+  "35996:SET_B_0X8C9C" \
+  "36269:SET_C_0X8DAD" \
+  "36542:SET_C_0X8EBE" \
+  "36815:SET_C_0X8FCF"
+do
+  op="${pair%%:*}"
+  cmd="${pair#*:}"
+  curl -s -X POST http://127.0.0.1:8888/api/admin/sync \
+    -H "Content-Type: application/json" \
+    -d "{\"opcode\":${op},\"command\":\"${cmd}\"}"
+  echo ""
+done
+import datetime
+import math
+import pandas as pd
+
+base_ts = datetime.datetime(2026, 11, 25, 22, 38, 10, tzinfo=datetime.timezone.utc)
+
+sets_spec = [
+    ("Set A (Primary Sync)", 54, [0x8525, 0x8636, 0x8747]),
+    ("Set B (High-Index Sweep)", 57, [0x8A7A, 0x8B8B, 0x8C9C]),
+    ("Set C (Tail Matrix)", 60, [0x8DAD, 0x8EBE, 0x8FCF]),
+]
+
+all_rows = []
+for set_name, start_seq, ops in sets_spec:
+    for idx, op in enumerate(ops):
+        seq = start_seq + idx
+        vx = float((op >> 8) & 0x0F)
+        vy = float(op & 0x0F)
+        k_idx = (vx * vy) / (abs(vx) + abs(vy) + 1.0)
+        ml_score = math.tanh(k_idx)
+        residual = abs(vy - (k_idx * 1.5))
+        ts = (base_ts + datetime.timedelta(seconds=len(all_rows))).strftime("%Y-%m-%d %H:%M:%S")
+        all_rows.append({
+            "Set": set_name,
+            "Timestamp_UTC": ts,
+            "Seq": seq,
+            "Opcode": f"0x{op:04X}",
+            "TI84_X": vx,
+            "TI84_Y": vy,
+            "Kalkul8_Idx": round(k_idx, 6),
+            "ML_Score": round(ml_score, 6),
+            "Residual": round(residual, 6),
+        })
+
+df = pd.DataFrame(all_rows)
+print(df.to_string(index=False))
+print("\nTotal queued rows:", len(df))
+print("Mean ML_Score:", round(df["ML_Score"].mean(), 6))
+print("Min ML_Score:", round(df["ML_Score"].min(), 6), "| Max ML_Score:", round(df["ML_Score"].max(), 6))
+print("Mean Residual:", round(df["Residual"].mean(), 6))
+
+curl -X POST http://127.0.0.1:8888/api/admin/flush
+    def archive_and_publish(self, batch_rows: list[list]) -> dict:
+        if not batch_rows:
+            return {"gcs": {"status": "skipped"}, "confluence": {"status": "skipped"}}
+
+        stamp_file = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        stamp_human = datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+        records = [
+            {
+                "timestamp_utc": r[0],
+                "seq": r[1],
+                "vx": r[2],
+                "vy": r[3],
+                "kalkul8_idx": r[4],
+                "ml_score": r[5],
+                "residual": r[6],
+            }
+            for r in batch_rows
+        ]
+
+        gcs_status = {"status": "skipped", "reason": "GCS not configured or google-cloud-storage missing"}
+        if HAS_GCS and GCS_BUCKET_NAME:
+            try:
+                client = gcs_storage.Client(project=GCP_PROJECT_ID or None)
+                blob_name = f"kalkul8_batches/flush_{stamp_file}.json"
+                blob = client.bucket(GCS_BUCKET_NAME).blob(blob_name)
+                blob.upload_from_string(json.dumps(records, indent=2), content_type="application/json")
+                gcs_status = {"status": "archived", "gcs_uri": f"gs://{GCS_BUCKET_NAME}/{blob_name}"}
+            except Exception as exc:
+                gcs_status = {"status": "error", "error": str(exc)}
+
+        conf_status = {"status": "skipped", "reason": "Confluence Cloud env vars not set"}
+        if CONFLUENCE_BASE_URL and CONFLUENCE_EMAIL and CONFLUENCE_API_TOKEN:
+            try:
+                auth_b64 = base64.b64encode(f"{CONFLUENCE_EMAIL}:{CONFLUENCE_API_TOKEN}".encode("utf-8")).decode("ascii")
+                html_body = (
+                    f"<p>Flushed {len(records)} Kalkul8 telemetry row(s) at {stamp_human}.</p>"
+                    f"<p><strong>GCS Archive:</strong> <code>{gcs_status.get('gcs_uri', 'n/a')}</code></p>"
+                    f'<p><strong>Google Sheet:</strong> <a href="{GOOGLE_SHEET_URL}">TI84_Graph_ML</a></p>'
+                )
+                req = urllib.request.Request(
+                    f"{CONFLUENCE_BASE_URL}/wiki/rest/api/content",
+                    data=json.dumps({
+                        "type": "page",
+                        "title": f"Kalkul8 Flush — {stamp_human}",
+                        "space": {"key": CONFLUENCE_SPACE_KEY},
+                        "body": {"storage": {"value": html_body, "representation": "storage"}},
+                    }).encode("utf-8"),
+                    headers={
+                        "Authorization": f"Basic {auth_b64}",
+                        "Accept": "application/json",
+                        "Content-Type": "application/json",
+                    },
+                    method="POST",
+                )
+                with urllib.request.urlopen(req, timeout=15) as resp:
+                    created = json.loads(resp.read().decode("utf-8"))
+                conf_status = {"status": "published", "page_id": created.get("id")}
+            except Exception as exc:
+                conf_status = {"status": "error", "error": str(exc)}
+
+        return {"gcs": gcs_status, "confluence": conf_status}
+import base64
+import json
+import urllib.error
+import urllib.request
+
+try:
+    from google.cloud import storage as gcs_storage
+    HAS_GCS = True
+except ImportError:
+    HAS_GCS = False
+
+CONFLUENCE_BASE_URL = os.getenv("CONFLUENCE_BASE_URL", "").rstrip("/")
+CONFLUENCE_SPACE_KEY = os.getenv("CONFLUENCE_SPACE_KEY", "KALKUL8")
+CONFLUENCE_EMAIL = os.getenv("CONFLUENCE_EMAIL", "")
+CONFLUENCE_API_TOKEN = os.getenv("CONFLUENCE_API_TOKEN", "")
+GCS_BUCKET_NAME = os.getenv("GCS_BUCKET_NAME", "")
+GCP_PROJECT_ID = os.getenv("GCP_PROJECT_ID", "")
+GOOGLE_SHEET_URL = os.getenv(
+    "GOOGLE_SHEET_URL",
+    "https://docs.google.com/spreadsheets/d/1-Nt-JK-ZN06JlpLKB-16kDKX2Eimlnrh_Dhwe4iXAsQ",
+)
+import os
+import urllib.request
+import json
+
+KALKUL8_BASE_URL = os.getenv("KALKUL8_BASE_URL", "http://127.0.0.1:8888")
+
+
+def _post_json(path: str, payload: dict | None = None) -> dict:
+    url = f"{KALKUL8_BASE_URL.rstrip('/')}{path}"
+    data = json.dumps(payload or {}).encode("utf-8")
+    req = urllib.request.Request(
+        url,
+        data=data,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def sync_crm_kalkul8_record(lead_id: str, command: str, opcode: int = 0x8525) -> dict:
+    """Sync a CRM lead/record event into the Kalkul8 CHIP-8 / ML pipeline."""
+    tagged_cmd = f"CRM_{lead_id}_{command}"
+    return _post_json("/api/admin/sync", {"opcode": opcode, "command": tagged_cmd})
+
+
+def flush_kalkul8_sheet_batch() -> dict:
+    """Flush queued Kalkul8 telemetry rows to the configured target/sheet."""
+    return _post_json("/api/admin/flush", {})
+
+
+def defrag_kalkul8_transports() -> dict:
+    """Run the 64-slot transport defragmenter across Tizen, Apple TV, IP, BLE, Wi-Fi, and Ethernet."""
+    return _post_json("/api/admin/defrag", {})
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+
+const char* WIFI_SSID = "YOUR_WIFI_SSID";
+const char* WIFI_PASS = "YOUR_WIFI_PASSWORD";
+const uint16_t SERVER_PORT = 8888;
+
+// Button & Power/Auto-Press Pins (adjust to match your ESP32 / ESP32-S3 / C5 board)
+static const uint8_t PIN_BOOT_BTN      = 0;   // Boot / Reboot button (active LOW)
+static const uint8_t PIN_PWR_ON_BTN    = 4;   // Power-On button (active LOW with INPUT_PULLUP)
+static const uint8_t PIN_PWR_LATCH_OUT = 5;   // Power-on / rail enable output (HIGH = ON)
+static const uint8_t PIN_AUTO_BTN_OUT  = 6;   // AI Auto-Button Press pulse output
+
+WebServer server(SERVER_PORT);
+
+bool powerOnState = true;
+bool aiAutoPressEnabled = true;
+uint32_t seqCounter = 49;
+uint32_t autoPressCount = 0;
+String lastEvent = "BOOT_READY";
+
+unsigned long lastBootBtnMs = 0;
+unsigned long lastPwrBtnMs = 0;
+unsigned long autoPressClearMs = 0;
+bool autoPressActive = false;
+
+void pulseAutoButton(uint16_t durationMs = 120) {
+  if (!powerOnState) {
+    powerOnState = true;
+    digitalWrite(PIN_PWR_LATCH_OUT, HIGH);
+  }
+  digitalWrite(PIN_AUTO_BTN_OUT, HIGH);
+  autoPressActive = true;
+  autoPressClearMs = millis() + durationMs;
+  autoPressCount++;
+}
+
+void triggerFirmwareSync(const String& sourceTag, const String& cmdPayload) {
+  seqCounter++;
+  lastEvent = "SYNC:" + sourceTag + ":" + cmdPayload;
+  if (aiAutoPressEnabled) {
+    pulseAutoButton(120);
+  }
+}
+
+void handleButtons() {
+  unsigned long now = millis();
+
+  // 1. BOOT / REBOOT button (hold or press -> reboot)
+  if (digitalRead(PIN_BOOT_BTN) == LOW && (now - lastBootBtnMs) > 350) {
+    lastBootBtnMs = now;
+    lastEvent = "REBOOT_BUTTON_PRESSED";
+    Serial.println("[BOOT/REBOOT] Button pressed -> restarting ESP32...");
+    delay(150);
+    ESP.restart();
+  }
+
+  // 2. POWER-ON button (toggles power-on latch state)
+  if (digitalRead(PIN_PWR_ON_BTN) == LOW && (now - lastPwrBtnMs) > 300) {
+    lastPwrBtnMs = now;
+    powerOnState = !powerOnState;
+    digitalWrite(PIN_PWR_LATCH_OUT, powerOnState ? HIGH : LOW);
+    lastEvent = powerOnState ? "POWER_ON_PRESSED" : "POWER_STANDBY_PRESSED";
+    Serial.printf("[PWR] State -> %s\n", powerOnState ? "ON" : "STANDBY");
+  }
+
+  // 3. Auto-release AI auto-button press pin
+  if (autoPressActive && (long)(now - autoPressClearMs) >= 0) {
+    digitalWrite(PIN_AUTO_BTN_OUT, LOW);
+    autoPressActive = false;
+  }
+}
+
+void handleApiSync() {
+  String body = server.hasArg("plain") ? server.arg("plain") : "{}";
+  triggerFirmwareSync("HTTP_SYNC", body);
+  String json = "{\"status\":\"synced\",\"seq\":" + String(seqCounter) +
+                ",\"power_on\":" + String(powerOnState ? "true" : "false") +
+                ",\"ai_auto_presses\":" + String(autoPressCount) +
+                ",\"event\":\"" + lastEvent + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void handleApiPowerReboot() {
+  String action = server.hasArg("action") ? server.arg("action") : "status";
+  if (action == "power_on") {
+    powerOnState = true;
+    digitalWrite(PIN_PWR_LATCH_OUT, HIGH);
+    lastEvent = "API_POWER_ON";
+  } else if (action == "auto_press") {
+    pulseAutoButton(150);
+    lastEvent = "API_AI_AUTO_PRESS";
+  } else if (action == "reboot") {
+    server.send(200, "application/json", "{\"status\":\"rebooting\"}");
+    delay(100);
+    ESP.restart();
+    return;
+  }
+  String json = "{\"power_on\":" + String(powerOnState ? "true" : "false") +
+                ",\"ai_auto_presses\":" + String(autoPressCount) +
+                ",\"seq\":" + String(seqCounter) +
+                ",\"event\":\"" + lastEvent + "\"}";
+  server.send(200, "application/json", json);
+}
+
+void setup() {
+  Serial.begin(115200);
+  Serial1.begin(115200, SERIAL_8N1, 17, 18);
+
+  pinMode(PIN_BOOT_BTN, INPUT_PULLUP);
+  pinMode(PIN_PWR_ON_BTN, INPUT_PULLUP);
+  pinMode(PIN_PWR_LATCH_OUT, OUTPUT);
+  pinMode(PIN_AUTO_BTN_OUT, OUTPUT);
+
+  // Power on immediately at boot
+  powerOnState = true;
+  digitalWrite(PIN_PWR_LATCH_OUT, HIGH);
+  digitalWrite(PIN_AUTO_BTN_OUT, LOW);
+  pulseAutoButton(100); // Initial AI boot auto-press check
+
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  unsigned long startMs = millis();
+  while (WiFi.status() != WL_CONNECTED && (millis() - startMs) < 8000) {
+    delay(250);
+  }
+
+  server.on("/api/admin/sync", HTTP_POST, handleApiSync);
+  server.on("/api/admin/power", HTTP_ANY, handleApiPowerReboot);
+  server.begin();
+  Serial.printf("[ESP32] Ready on port %u | IP: %s\n", SERVER_PORT, WiFi.localIP().toString().c_str());
+}
+
+void loop() {
+  handleButtons();
+  server.handleClient();
+
+  while (Serial1.available() > 0) {
+    String line = Serial1.readStringUntil('\n');
+    line.trim();
+    if (line.length() > 0) {
+      triggerFirmwareSync("UART1", line);
+      Serial1.printf("{\"ack\":\"sync\",\"seq\":%u,\"auto_presses\":%u}\n",
+                     seqCounter, autoPressCount);
+    }
+  }
+}
+kalkul8_ready_runner.py with --sheet-id 1-Nt-JK-ZN06JlpLKB-16kDKX2Eimlnrh_Dhwe4iXAsQ --sheet-tab TI84_Graph_ML --creds s# Install dependencies (bleak is optional if testing HTTP/UI/Sheets first)
+pip install aiohttp gspread google-auth
+
+# Start the server + UI on port 8888
+python kalkul8_ready_runner.py --port 8888 --sheet-tab TI84_Graph_ML --creds service_account.json
+import argparse
+import asyncio
+import datetime
+import hashlib
+import math
+import os
+import struct
+from aiohttp import web
+import gspread
+from google.oauth2.service_account import Credentials
+
+# Optional BLE library (gracefully falls back if not installed in local/Colab test mode)
+try:
+    from bleak import BleakClient, BleakScanner
+    HAS_BLEAK = True
+except ImportError:
+    HAS_BLEAK = False
+
+DEFAULT_SPREADSHEET_ID = os.getenv("KALKUL8_SHEET_ID", "1-Nt-JK-ZN06JlpLKB-16kDKX2Eimlnrh_Dhwe4iXAsQ")
+DEFAULT_WORKSHEET = os.getenv("KALKUL8_SHEET_TAB", "TI84_Graph_ML")
+DEFAULT_CREDS = os.getenv("KALKUL8_CREDS_FILE", "service_account.json")
+BLE_DEVICE_NAME = "KALKUL8-TI84-BLE"
+BLE_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+
+def crc8(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc ^= b
+    return crc
+
+
+def sort_command_letters(raw_cmd: str) -> str:
+    return "".join(sorted(ch for ch in raw_cmd if ch.isalpha())).upper()
+
+
+def decode_chip8_frame(frame: bytes, corp_tag: str = "S_CORP_ADMIN") -> dict:
+    if len(frame) < 4:
+        raise ValueError("Frame too short")
+    body, rx_crc = frame[:-1], frame[-1]
+    if crc8(body) != rx_crc:
+        raise ValueError("CRC8 check failed")
+
+    (opcode,) = struct.unpack(">H", body[:2])
+    payload_str = body[2:].decode("utf-8", errors="replace")
+    sorted_key = sort_command_letters(payload_str)
+    digest = hashlib.sha256(body).hexdigest()[:12]
+
+    vx = float((opcode >> 8) & 0x0F)
+    vy = float(opcode & 0x0F)
+    k_idx = (vx * vy) / (abs(vx) + abs(vy) + 1.0)
+    ml_score = math.tanh(k_idx)
+
+    return {
+        "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "opcode_hex": f"0x{opcode:04X}",
+        "corp": corp_tag,
+        "raw_payload": payload_str,
+        "sorted_letters": sorted_key,
+        "sha256_prefix": digest,
+        "vx": vx,
+        "vy": vy,
+        "kalkul8_idx": round(k_idx, 6),
+        "ml_score": round(ml_score, 6),
+    }
+
+
+async def check_tcp(host: str, port: int, timeout: float = 0.4) -> bool:
+    try:
+        _, writer = await asyncio.wait_for(asyncio.open_connection(host, port), timeout=timeout)
+        writer.close()
+        await writer.wait_closed()
+        return True
+    except Exception:
+        return False
+
+
+class BufferBlock:
+    def __init__(self, slot_id: int, transport: str, endpoint: str, seq: int, payload_bytes: int, ts: float, pinned: bool = False):
+        self.slot_id = slot_id
+        self.transport = transport.upper()
+        self.endpoint = endpoint
+        self.seq = seq
+        self.payload_bytes = payload_bytes
+        self.ts = ts
+        self.pinned = pinned
+        self.online = True
+
+
+class Kalkul8Engine:
+    def __init__(self, spreadsheet_id: str, worksheet_name: str, creds_file: str, total_slots: int = 64, stale_ttl: float = 30.0):
+        self.seq = 41
+        self.synced_total = 41
+        self.pending_rows: list[list] = []
+        self.ws = None
+        self.sheets_ready = False
+        self.total_slots = total_slots
+        self.stale_ttl = stale_ttl
+        self.slots: list[BufferBlock | None] = [None] * total_slots
+        self.stats = {
+            "passes": 0,
+            "blocks_moved": 0,
+            "stale_purged": 0,
+            "fragmentation_before": 0.0,
+            "fragmentation_after": 0.0,
+        }
+        self._init_sheets(spreadsheet_id, worksheet_name, creds_file)
+        self._seed_slots()
+
+    def _init_sheets(self, spreadsheet_id: str, worksheet_name: str, creds_file: str):
+        if not os.path.exists(creds_file):
+            print(f"[Sheets] '{creds_file}' not found; running in local/queued mode.")
+            return
+        try:
+            creds = Credentials.from_service_account_file(creds_file, scopes=SCOPES)
+            gc = gspread.authorize(creds)
+            self.ws = gc.open_by_key(spreadsheet_id).worksheet(worksheet_name)
+            self.sheets_ready = True
+            print(f"[Sheets] Connected to worksheet '{worksheet_name}'.")
+        except Exception as exc:
+            print(f"[Sheets] Offline/queued mode ({exc})")
+
+    def _seed_slots(self):
+        self.allocate_slot("TIZEN", "192.168.1.50:8001", 1, 256, pinned=True)
+        self.allocate_slot("APPLE_TV", "192.168.1.51:7000", 2, 256, pinned=True)
+        self.allocate_slot("ETHERNET", "192.168.1.10:8888", 3, 1024, pinned=False)
+        self.allocate_slot("WIFI", "192.168.1.25:8888", 4, 512, pinned=False)
+        self.allocate_slot("BLE", "BLE:0x8525", 5, 68, pinned=False)
+
+    def allocate_slot(self, transport: str, endpoint: str, seq: int, payload_bytes: int, pinned: bool = False) -> int:
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            now = 0.0
+        for idx, b in enumerate(self.slots):
+            if b is None:
+                self.slots[idx] = BufferBlock(idx, transport, endpoint, seq, payload_bytes, now, pinned)
+                return idx
+        for idx, b in enumerate(self.slots):
+            if b and not b.pinned:
+                self.slots[idx] = BufferBlock(idx, transport, endpoint, seq, payload_bytes, now, pinned)
+                return idx
+        return 0
+
+    def _frag_pct(self) -> float:
+        occ = [i for i, b in enumerate(self.slots) if b is not None]
+        if len(occ) <= 1:
+            return 0.0
+        span = occ[-1] - occ[0] + 1
+        return round(((span - len(occ)) / span) * 100.0, 2)
+
+    async def defragment(self) -> dict:
+        try:
+            now = asyncio.get_running_loop().time()
+        except RuntimeError:
+            now = 0.0
+        frag_before = self._frag_pct()
+        purged = 0
+
+        probes = {}
+        for idx, b in enumerate(self.slots):
+            if b and ":" in b.endpoint and not b.endpoint.startswith("BLE:"):
+                host, port_s = b.endpoint.split(":", 1)
+                probes[idx] = asyncio.create_task(check_tcp(host, int(port_s)))
+        if probes:
+            res = await asyncio.gather(*probes.values())
+            for idx, ok in zip(probes.keys(), res):
+                if self.slots[idx]:
+                    self.slots[idx].online = ok
+
+        active: list[BufferBlock] = []
+        for b in self.slots:
+            if b is None:
+                continue
+            if not b.pinned and now > 0 and (now - b.ts) > self.stale_ttl:
+                purged += 1
+            else:
+                active.append(b)
+
+        prio = {"ETHERNET": 0, "WIFI": 1, "TIZEN": 2, "APPLE_TV": 3, "BLE": 4}
+        active.sort(key=lambda b: (prio.get(b.transport, 9), b.seq))
+
+        new_slots: list[BufferBlock | None] = [None] * self.total_slots
+        moved = 0
+        for new_idx, b in enumerate(active):
+            if b.slot_id != new_idx:
+                moved += 1
+            b.slot_id = new_idx
+            new_slots[new_idx] = b
+
+        self.slots = new_slots
+        frag_after = self._frag_pct()
+        self.stats.update({
+            "passes": self.stats["passes"] + 1,
+            "blocks_moved": self.stats["blocks_moved"] + moved,
+            "stale_purged": self.stats["stale_purged"] + purged,
+            "fragmentation_before": frag_before,
+            "fragmentation_after": frag_after,
+        })
+
+        grid = []
+        for idx, b in enumerate(self.slots):
+            if b is None:
+                grid.append({"slot": idx, "state": "FREE", "transport": None, "label": ".", "online": None})
+            elif b.pinned:
+                grid.append({"slot": idx, "state": "PINNED_SYS", "transport": b.transport, "endpoint": b.endpoint, "label": b.transport[0], "online": b.online})
+            else:
+                grid.append({"slot": idx, "state": "OPTIMIZED", "transport": b.transport, "endpoint": b.endpoint, "label": b.transport[0], "online": b.online})
+        return {"stats": self.stats, "grid": grid}
+
+    def ingest_packet(self, opcode: int, command: str) -> dict:
+        body = struct.pack(">H", opcode & 0xFFFF) + command.encode("utf-8")
+        frame = body + bytes([crc8(body)])
+        parsed = decode_chip8_frame(frame)
+        residual = round(abs(parsed["vy"] - (parsed["kalkul8_idx"] * 1.5)), 6)
+        row = [
+            parsed["timestamp_utc"],
+            self.seq,
+            parsed["vx"],
+            parsed["vy"],
+            parsed["kalkul8_idx"],
+            parsed["ml_score"],
+            residual,
+        ]
+        current_seq = self.seq
+        self.seq += 1
+        self.synced_total += 1
+        self.pending_rows.append(row)
+        self.allocate_slot("BLE", f"BLE:{parsed['opcode_hex']}", current_seq, len(frame), pinned=False)
+
+        if len(self.pending_rows) >= 3:
+            self.flush_sheets()
+
+        parsed["seq"] = current_seq
+        parsed["synced_total"] = self.synced_total
+        parsed["sheets_live"] = self.sheets_ready
+        parsed["queued_rows"] = len(self.pending_rows)
+        return parsed
+
+    def flush_sheets(self):
+        if not self.pending_rows:
+            return
+        batch = self.pending_rows[:]
+        self.pending_rows.clear()
+        if self.ws:
+            self.ws.append_rows(batch, value_input_option="USER_ENTERED")
+            print(f"[Sheets] Appended {len(batch)} rows.")
+        else:
+            print(f"[Queue] Flushed {len(batch)} rows locally (connect service_account.json for live sheet write).")
+
+
+HTML_UI = """<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>KALKUL8 // Ready-to-Run Console</title>
+  <style>
+    body { margin: 0; font-family: system-ui, sans-serif; background: #0d1219; color: #e2e8f0; padding: 18px; }
+    .wrap { max-width: 1080px; margin: 0 auto; display: grid; gap: 16px; }
+    .bar { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 10px;
+           background: #161f2c; border: 1px solid #293548; border-radius: 10px; padding: 14px 18px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(330px, 1fr)); gap: 16px; }
+    .card { background: #161f2c; border: 1px solid #293548; border-radius: 10px; padding: 16px; display: grid; gap: 10px; }
+    input, select { width: 100%; padding: 8px 10px; border-radius: 6px; border: 1px solid #334155;
+                     background: #0f1722; color: #f8fafc; font-family: monospace; box-sizing: border-box; }
+    button { padding: 9px 14px; border: 0; border-radius: 6px; font-weight: 700; cursor: pointer;
+             background: #2563eb; color: #fff; }
+    button.ok { background: #059669; }
+    button.alt { background: #475569; }
+    .btns { display: flex; flex-wrap: wrap; gap: 8px; }
+    pre { margin: 0; background: #0b0f15; border: 1px solid #263244; border-radius: 6px;
+          padding: 10px; font-size: 12px; overflow-x: auto; color: #cbd5e1; }
+    #slots { display: grid; grid-template-columns: repeat(16, 1fr); gap: 4px;
+             background: #0b0f15; padding: 10px; border-radius: 6px; border: 1px solid #263244; }
+    .cell { aspect-ratio: 1; display: flex; align-items: center; justify-content: center;
+            font-family: monospace; font-size: 11px; font-weight: 700; border-radius: 3px; }
+    .FREE { background: #131b26; color: #475569; }
+    .PINNED_SYS { background: #7f1d1d; color: #fecaca; border: 1px solid #ef4444; }
+    .OPTIMIZED { background: #1e3a8a; color: #dbeafe; border: 1px solid #3b82f6; }
+  </style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="bar">
+      <div>
+        <strong>KALKUL8 // READY-TO-RUN AGENT CONSOLE</strong>
+        <div style="font-size:12px;color:#94a3b8;">CHIP-8 0x8525 &bull; Letter Sort &bull; Kalkul8 ML &bull; Tizen/Apple TV/IP/BLE/Wi-Fi/Ethernet Defrag</div>
+      </div>
+      <div id="status-pill" style="font-family:monospace;font-size:12px;padding:6px 10px;border-radius:999px;background:#0f1722;border:1px solid #10b981;color:#34d399;">ONLINE :8888</div>
+    </div>
+
+    <div class="grid">
+      <div class="card">
+        <strong>1. BLE / Admin Packet Upload</strong>
+        <input id="op" value="0x8525" />
+        <input id="cmd" value="ICE_KRAM_KIIMI_WIN2000ME_OFFICE_ED" />
+        <div class="btns">
+          <button class="ok" onclick="sendSync()">Sync Packet</button>
+          <button class="alt" onclick="flushNow()">Flush Sheet Batch</button>
+        </div>
+        <pre id="sync-res">Waiting for packet...</pre>
+      </div>
+
+      <div class="card">
+        <strong>2. Transport Defragmenter (64 Slots)</strong>
+        <div class="btns">
+          <button onclick="runDefrag()">Run Defrag &amp; Probe</button>
+        </div>
+        <div id="defrag-summary" style="font-family:monospace;font-size:12px;color:#93c5fd;">Ready</div>
+        <div id="slots"></div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    async function sendSync() {
+      const opcode = parseInt(document.getElementById("op").value.trim(), 16) || 0x8525;
+      const command = document.getElementById("cmd").value.trim();
+      const r = await fetch("/api/admin/sync", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ opcode, command })
+      });
+      const data = await r.json();
+      document.getElementById("sync-res").textContent = JSON.stringify(data, null, 2);
+      await runDefrag();
+    }
+
+    async function flushNow() {
+      const r = await fetch("/api/admin/flush", { method: "POST" });
+      const data = await r.json();
+      document.getElementById("sync-res").textContent = JSON.stringify(data, null, 2);
+    }
+
+    async function runDefrag() {
+      const r = await fetch("/api/admin/defrag", { method: "POST" });
+      const data = await r.json();
+      const s = data.stats;
+      document.getElementById("defrag-summary").textContent =
+        `Pass #${s.passes} | Frag ${s.fragmentation_before}% -> ${s.fragmentation_after}% | Moved ${s.blocks_moved}`;
+      const el = document.getElementById("slots");
+      el.innerHTML = "";
+      for (const c of data.grid) {
+        const d = document.createElement("div");
+        d.className = `cell ${c.state}`;
+        d.title = c.transport ? `#${c.slot} ${c.transport}` : `#${c.slot} FREE`;
+        d.textContent = c.label;
+        el.appendChild(d);
+      }
+    }
+
+    runDefrag();
+  </script>
+</body>
+</html>
+"""
+
+
+async def handle_index(_request: web.Request) -> web.Response:
+    return web.Response(text=HTML_UI, content_type="text/html")
+
+
+async def handle_sync(request: web.Request) -> web.Response:
+    engine: Kalkul8Engine = request.app["engine"]
+    payload = await request.json()
+    opcode = int(payload.get("opcode", 0x8525))
+    command = str(payload.get("command", "ICE_KRAM_KIIMI_WIN2000ME_OFFICE_ED"))
+    result = engine.ingest_packet(opcode, command)
+    return web.json_response({"status": "ok", "packet": result})
+
+
+async def handle_flush(request: web.Request) -> web.Response:
+    engine: Kalkul8Engine = request.app["engine"]
+    queued_before = len(engine.pending_rows)
+    engine.flush_sheets()
+    return web.json_response({"status": "flushed", "rows_flushed": queued_before, "sheets_live": engine.sheets_ready})
+
+
+async def handle_defrag(request: web.Request) -> web.Response:
+    engine: Kalkul8Engine = request.app["engine"]
+    report = await engine.defragment()
+    return web.json_response(report)
+
+
+async def ble_listener(engine: Kalkul8Engine):
+    if not HAS_BLEAK:
+        return
+    device = await BleakScanner.find_device_by_name(BLE_DEVICE_NAME, timeout=6.0)
+    if not device:
+        return
+
+    def _on_notify(_sender: int, data: bytearray):
+        try:
+            parsed = decode_chip8_frame(bytes(data))
+            engine.ingest_packet(int(parsed["opcode_hex"], 16), parsed["raw_payload"])
+        except Exception as exc:
+            print(f"[BLE] Frame error: {exc}")
+
+    async with BleakClient(device) as client:
+        print(f"[BLE] Connected to {BLE_DEVICE_NAME} ({device.address})")
+        await client.start_notify(BLE_CHAR_UUID, _on_notify)
+        while client.is_connected:
+            await asyncio.sleep(1.0)
+
+
+async def main_async(host: str, port: int, sheet_id: str, sheet_tab: str, creds_file: str):
+    engine = Kalkul8Engine(sheet_id, sheet_tab, creds_file)
+    app = web.Application()
+    app["engine"] = engine
+    app.router.add_get("/", handle_index)
+    app.router.add_post("/api/admin/sync", handle_sync)
+    app.router.add_post("/api/admin/flush", handle_flush)
+    app.router.add_post("/api/admin/defrag", handle_defrag)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, host, port)
+    await site.start()
+    print(f"[Ready] Open http://127.0.0.1:{port} (bound to {host}:{port})")
+
+    asyncio.create_task(ble_listener(engine))
+    try:
+        while True:
+            await asyncio.sleep(3600)
+    finally:
+        engine.flush_sheets()
+        await runner.cleanup()
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Kalkul8 Ready-to-Run Agent & Console")
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=8888)
+    parser.add_argument("--sheet-id", default=DEFAULT_SPREADSHEET_ID)
+    parser.add_argument("--sheet-tab", default=DEFAULT_WORKSHEET)
+    parser.add_argument("--creds", default=DEFAULT_CREDS)
+    args = parser.parse_args()
+    asyncio.run(main_async(args.host, args.port, args.sheet_id, args.sheet_tab, args.creds))
+
+
+if __name__ == "__main__":
+    main()
+docker run --gpus=all -p 127.0.0.1:9000:8080 us-docker.pkg.dev/colab-images/public/runtime
+import asyncio
+import datetime
+import hashlib
+import math
+import struct
+from aiohttp import web, ClientSession
+from bleak import BleakClient, BleakScanner
+import gspread
+from google.oauth2.service_account import Credentials
+
+# --- Target Configuration ---
+BLE_DEVICE_NAME = "KALKUL8-TI84-BLE"
+BLE_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+LOCAL_SUBNET_BIND = "0.0.0.0"   # Accessible on local LAN (192.168.1.x) & Hotspot AP
+LOCAL_HTTP_PORT = 8888
+CORP_TAG = "S_CORP_ADMIN"
+
+SPREADSHEET_ID = "1-Nt-JK-ZN06JlpLKB-16kDKX2Eimlnrh_Dhwe4iXAsQ"
+WORKSHEET_NAME = "TI84_Graph_ML"
+CREDS_FILE = "service_account.json"
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+
+
+def crc8(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc ^= b
+    return crc
+
+
+def sort_command_letters(raw_cmd: str) -> str:
+    """Extracts and alphabetically sorts command characters for deterministic routing."""
+    return "".join(sorted(ch for ch in raw_cmd if ch.isalpha())).upper()
+
+
+def decode_chip8_admin_frame(frame: bytes) -> dict:
+    """Parses [opcode: u16 BE][payload: utf-8][crc8: u8] and computes Kalkul8 ML metrics."""
+    if len(frame) < 4:
+        raise ValueError("BLE frame too short")
+    body, rx_crc = frame[:-1], frame[-1]
+    if crc8(body) != rx_crc:
+        raise ValueError("CRC8 validation failed")
+
+    (opcode,) = struct.unpack(">H", body[:2])
+    payload_str = body[2:].decode("utf-8", errors="replace")
+    sorted_key = sort_command_letters(payload_str)
+    digest = hashlib.sha256(body).hexdigest()[:12]
+
+    # Map 16-bit opcode nibbles (X, Y) into Kalkul8 ML feature space
+    vx = float((opcode >> 8) & 0x0F)
+    vy = float(opcode & 0x0F)
+    k_idx = (vx * vy) / (abs(vx) + abs(vy) + 1.0)
+    ml_score = math.tanh(k_idx)
+
+    return {
+        "timestamp_utc": datetime.datetime.now(datetime.timezone.utc).strftime("%Y-%m-%d %H:%M:%S"),
+        "opcode_hex": f"0x{opcode:04X}",
+        "corp": CORP_TAG,
+        "raw_payload": payload_str,
+        "sorted_letters": sorted_key,
+        "sha256_prefix": digest,
+        "vx": vx,
+        "vy": vy,
+        "kalkul8_idx": round(k_idx, 6),
+        "ml_score": round(ml_score, 6),
+    }
+
+
+class AdminSubnetSyncAgent:
+    def __init__(self):
+        self.seq = 31  # Continues cleanly after Seq 0..30 in TI84_Graph_ML
+        self.pending_rows: list[list] = []
+        self.ws = None
+        self._init_sheets()
+
+    def _init_sheets(self):
+        try:
+            creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+            gc = gspread.authorize(creds)
+            self.ws = gc.open_by_key(SPREADSHEET_ID).worksheet(WORKSHEET_NAME)
+        except Exception as exc:
+            print(f"[Sheets] Offline/local-only mode ({exc})")
+
+    def queue_telemetry(self, parsed: dict):
+        residual = round(abs(parsed["vy"] - (parsed["kalkul8_idx"] * 1.5)), 6)
+        row = [
+            parsed["timestamp_utc"],
+            self.seq,
+            parsed["vx"],
+            parsed["vy"],
+            parsed["kalkul8_idx"],
+            parsed["ml_score"],
+            residual,
+        ]
+        self.seq += 1
+        self.pending_rows.append(row)
+        if len(self.pending_rows) >= 5:
+            self.flush_sheets()
+
+    def flush_sheets(self):
+        if not self.pending_rows or not self.ws:
+            return
+        batch = self.pending_rows[:]
+        self.pending_rows.clear()
+        self.ws.append_rows(batch, value_input_option="USER_ENTERED")
+        print(f"[Sheets] Synced {len(batch)} admin telemetry rows.")
+
+    async def handle_http_sync(self, request: web.Request) -> web.Response:
+        """Local subnet/hotspot HTTP endpoint for Win2000/ME, ESP32 AP+STA, or desktop clients."""
+        data = await request.json()
+        opcode = int(data.get("opcode", 0x8525))
+        cmd = str(data.get("command", "ICE_KRAM_KIIMI_WIN2000ME_OFFICE_ED"))
+        body = struct.pack(">H", opcode & 0xFFFF) + cmd.encode("utf-8")
+        frame = body + bytes([crc8(body)])
+        parsed = decode_chip8_admin_frame(frame)
+        self.queue_telemetry(parsed)
+        return web.json_response({"status": "synced", "seq": self.seq - 1, "packet": parsed})
+
+    def on_ble_packet(self, _sender: int, data: bytearray):
+        try:
+            parsed = decode_chip8_admin_frame(bytes(data))
+            self.queue_telemetry(parsed)
+            print(f"[BLE->Subnet] {parsed['opcode_hex']} sorted={parsed['sorted_letters']} ml={parsed['ml_score']}")
+        except Exception as exc:
+            print(f"[BLE] Frame rejected: {exc}")
+
+
+async def run_agent():
+    agent = AdminSubnetSyncAgent()
+
+    # 1. Start local subnet + hotspot HTTP bridge (port 8888)
+    app = web.Application()
+    app.router.add_post("/api/admin/sync", agent.handle_http_sync)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, LOCAL_SUBNET_BIND, LOCAL_HTTP_PORT)
+    await site.start()
+    print(f"[Subnet Bridge] Listening on http://{LOCAL_SUBNET_BIND}:{LOCAL_HTTP_PORT}/api/admin/sync")
+
+    # 2. Attach BLE listener if ESP32 peripheral is advertising nearby
+    device = await BleakScanner.find_device_by_name(BLE_DEVICE_NAME, timeout=8.0)
+    if device:
+        async with BleakClient(device) as client:
+            print(f"[BLE] Connected to {BLE_DEVICE_NAME} ({device.address})")
+            await client.start_notify(BLE_CHAR_UUID, agent.on_ble_packet)
+            while client.is_connected:
+                await asyncio.sleep(1.0)
+    else:
+        print(f"[BLE] '{BLE_DEVICE_NAME}' not advertising; staying active on local Wi-Fi subnet.")
+        while True:
+            await asyncio.sleep(5.0)
+
+
+if __name__ == "__main__":
+    asyncio.run(run_agent())
+kalkul8_ble_sheets_engine.py SPREADSHEET_ID = "1-Nt-JK-ZN06JlpLKB-16kDKX2Eimlnrh_Dhwe4iXAsQ"
+WORKSHEET_NAME = "TI84_Graph_ML"
+import asyncio
+import datetime
+import math
+import struct
+from bleak import BleakClient, BleakScanner
+import gspread
+from google.oauth2.service_account import Credentials
+
+DEVICE_NAME = "KALKUL8-TI84-BLE"
+TX_CHAR_UUID = "6e400003-b5a3-f393-e0a9-e50e24dcca9e"
+
+SCOPES = ["https://www.googleapis.com/auth/spreadsheets"]
+CREDS_FILE = "service_account.json"
+SPREADSHEET_ID = "YOUR_SPREADSHEET_ID"
+WORKSHEET_NAME = "TI84_Graph_ML"
+BATCH_SIZE = 10
+
+
+def crc8(data: bytes) -> int:
+    crc = 0
+    for b in data:
+        crc ^= b
+    return crc
+
+
+def kalkul8_ml_transform(seq: int, x: float, y: float) -> list:
+    """Computes Kalkul8 index, ML activation weight, and pyramid-normalized metric."""
+    k_idx = (x * y) / (abs(x) + abs(y) + 1.0)
+    ml_score = math.tanh(k_idx)
+    residual = abs(y - (k_idx * 1.5))
+    ts = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    return [ts, seq, round(x, 6), round(y, 6), round(k_idx, 6), round(ml_score, 6), round(residual, 6)]
+
+
+class BleSheetsUploadEngine:
+    def __init__(self):
+        creds = Credentials.from_service_account_file(CREDS_FILE, scopes=SCOPES)
+        gc = gspread.authorize(creds)
+        self.sheet = gc.open_by_key(SPREADSHEET_ID)
+        self.ws = self.sheet.worksheet(WORKSHEET_NAME)
+        self.buffer: list[list] = []
+        self._ensure_headers()
+
+    def _ensure_headers(self):
+        if not self.ws.row_values(1):
+            self.ws.append_row(
+                ["Timestamp_UTC", "Seq", "TI84_X", "TI84_Y", "Kalkul8_Idx", "ML_Score", "Residual"],
+                value_input_option="USER_ENTERED",
+            )
+
+    def flush(self):
+        if not self.buffer:
+            return
+        rows_to_push = self.buffer[:]
+        self.buffer.clear()
+        self.sheet.values_append(
+            f"{WORKSHEET_NAME}!A1",
+            {"valueInputOption": "USER_ENTERED"},
+            {"values": rows_to_push},
+        )
+        print(f"[Sheets] Uploaded {len(rows_to_push)} rows.")
+
+    def on_ble_notify(self, _sender: int, data: bytearray):
+        if len(data) != 11:
+            return
+        body, rx_crc = bytes(data[:10]), data[10]
+        if crc8(body) != rx_crc:
+            print("[BLE] Dropped packet: CRC mismatch")
+            return
+
+        seq, x, y = struct.unpack("<Hff", body)
+        row = kalkul8_ml_transform(seq, x, y)
+        self.buffer.append(row)
+        print(f"[BLE] seq={seq} x={x:.3f} y={y:.3f} -> ml={row[5]:.4f}")
+
+        if len(self.buffer) >= BATCH_SIZE:
+            self.flush()
+
+
+async def main():
+    engine = BleSheetsUploadEngine()
+    print(f"Scanning for {DEVICE_NAME}...")
+    device = await BleakScanner.find_device_by_name(DEVICE_NAME, timeout=15.0)
+    if not device:
+        raise RuntimeError(f"Could not find BLE device '{DEVICE_NAME}'")
+
+    async with BleakClient(device) as client:
+        print(f"Connected to {device.address}")
+        await client.start_notify(TX_CHAR_UUID, engine.on_ble_notify)
+        try:
+            while client.is_connected:
+                await asyncio.sleep(1.0)
+        finally:
+            await client.stop_notify(TX_CHAR_UUID)
+            engine.flush()
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+[TI-84 Plus CE] ──(USB / UART / CSV Export)──▶ [ESP32 BLE Peripheral]
+                                                       │
+                                           (BLE GATT Notifications)
+                                                       ▼
+                                           [Python Host Upload Engine]
+                                             ├─ Reassemble & CRC Check
+                                             ├─ Kalkul8 ML Scoring
+                                             └─ Batch Append (gspread)
+                                                       │
+                                                       ▼
+                                               [Google Sheets]
+ADD A DEBUG GI AI BLE UPLOAD ENGINE APP FOR GEFORCE 8K GAME CREATION ASSEMBLY86 CODE UPLOADER APP CALLED ESP32 S5 ASSEMBLY NES AUTPLAYER ZELDA NES EMULATED VERSION APP CALLED PENTAWIRE APPBuild a esp32 s5 ,developer agent auto create ble uploaded assembly86 sync with RUST CODE, BLE SEND UPLOAD to current UI FOR SMART THINK AIBYNEXT DESKTOP <INSERT>KIMI AI WIN2000 365 UPDATE AUTOMATIC FUNCTION ASSEMBLY CLONE 95,97 2000ME AND SYNC TO MS OFFIDE 365 API<5256000>CODESPACE BUILD CRM USE IBM.COM AGENT BOB CRM AI 9BIT PER BYTE KALKUL8 BASIC CALCULATOR DUAL RECTANGULAR SMART THINK ESVISION SELF THINK SELF ML AND A GENERAL INTELLIGENCE APPLICATION REVISION CURRENT MS OFFICE365 SATA SSD WINDOWS 11 AUTOMATIC SAVE AS CONTAINER CARDBOARD CFTT AND BUILD AN GI AI UPDATER FOR MS OFFICE KIMI AI CLOUD CLIENT WANG VERSION AGENT KALKUL8 GI APP IN RUST CODE CONVERT TO JCODEPY PSEUDOCODE DATA AND BLE SYNC UPLOAD AUTOMATED WEBFLOW DEBUGGING FOR ESP32 S5 KIT AND RASPBERRY PI ANDROID, GEFORCE CARD, VARIABLE SAVED CLIPBOARD  CONSTANT LIVESRREAM UPLOADS VIA BLE CONNECTED ESP32 S5 DEBUG FIRMWARE REAL TIME LIVE UPLOADSBuild a esp32 s5 ,developer agent auto create ble uploaded assembly86 sync with RUST CODE, BLE SEND UPLOAD to current UI FOR SMART THINK AIBYNEXT DESKTOP <INSERT>KIMI AI WIN2000 365 UPDATE AUTOMATIC FUNCTION ASSEMBLY CLONE 95,97 2000ME AND SYNC TO MS OFFIDE 365 API<5256000>CODESPACE BUILD CRM USE IBM.COM AGENT BOB CRM AI 9BIT PER BYTE KALKUL8 BASIC CALCULATOR DUAL RECTANGULAR SMART THINK ESVISION SELF THINK SELF ML AND A GENERAL INTELLIGENCE APPLICATION REVISION CURRENT MS OFFICE365 SATA SSD WINDOWS 11 AUTOMATIC SAVE AS CONTAINER CARDBOARD CFTT AND BUILD AN GI AI UPDATER FOR MS OFFICE KIMI AI CLOUD CLIENT WANG VERSION AGENT KALKUL8 GI APP IN RUST CODE CONVERT TO JCODEPY PSEUDOCODE DATA AND BLE SYNC UPLOAD AUTOMATED WEBFLOW DEBUGGING FOR ESP32 S5 KIT AND RASPBERRY PI ANDROID, GEFORCE CARD, VARIABLE SAVED CLIPBOARD  CONSTANT LIVESRREAM UPLOADS VIA BLE CONNECTED ESP32 S5 DEBUG FIRMWARE REAL TIME LIVE UPLOADS---
+title: Quick Start
+---
+
+import { Aside, CardGrid, Card } from '@astrojs/starlight/components';
+
+### Connect First Time
+
+<CardGrid>
+
+<Card>
+
+Click on the IBM i icon and then on 'Connect to an IBM i'.
+
+</Card><Card>
+
+![](../../assets/code_for_i/features/connection/connect_02.png)
+
+</Card></CardGrid>
+
+---
+
+<CardGrid>
+<Card>
+Enter the system details in the window that appears. You will need a password, a private key, or an SSH agent with the identities properly configured.
+
+Alternatively, press <kbd>F1</kbd>, search for `IBM i: New Connection`, and complete the form.
+<Aside type="note">
+   If you have multi-factor authentication (MFA) enabled on your IBM i, make sure to select the `Enable Multi-Factor Authentication (MFA)` option. When enabled, this will prompt you for your additional factor when attempting to connect. Enter your TOTP in this prompt or press "Enter" if within your TOTP interval.
+</Aside>
+</Card>
+<Card>
+![](../../assets/code_for_i/features/connection/connect_03.png)
+</Card>
+</CardGrid>
+
+### Connect Subsequent
+
+<CardGrid>
+<Card>
+If you have already connected to an IBM i system, click on the conection in the IBM i: Servers browser.
+</Card>
+<Card>
+![](../../assets/code_for_i/features/connection/connect_04.png)
+</Card>
+</CardGrid>
+
+<CardGrid>
+<Card>
+After logging in, a status bar item will appear showing the name of the IBM i system to which you are connected.
+</Card>
+<Card>
+![Connection editor](../../assets/code_for_i/features/connection/connect_05.png)
+</Card>
+</CardGrid>
+
+### Logout (Disconnect)
+You can close a connection  and logout out from a server in several ways
+<CardGrid>
+
+<Card>
+Use the keyboard: <kbd>Ctrl(Cmd)</kbd> + <kbd>Alt</kbd > + <kbd>D</kbd>
+</Card>
+<Card>
+</Card>
+<Card>
+Click the `Disconnect from system` icon in the status bar... 
+</Card>
+<Card>
+![Disconnect icon](../../assets/code_for_i/features/connection/connect_08.png)
+</Card>
+<Card>
+Press <kbd>F1</kbd> and search for `IBM i: Disconnect`
+</Card>
+<Card>
+![Search Disconnect](../../assets/code_for_i/features/connection/connect_07.png)
+</Card>
+
+</CardGrid>
+
+---
+
+### Browse/Edit source members
+
+1. Connect to your system.
+2. Find the **Object Browser** and click **+ Create new filter**.
+3. Complete the new filter dialog, following the descriptive text, ensuring:
+   a. That **Object** is the source physical file you want to edit.
+   b. That **Object type filter** is set to `*SRCPF`.
+4. Save settings
+5. Click on the filter to expand the members in the source file.
+6. Click on a member to open it.
+
+<Aside type="note">
+   There is no member locking and the extension defaults to not retaining source dates.
+</Aside>
+
+### How do I compile my source code?
+
+1. Edit your library list in the 'USER LIBRARY LIST' browser. (Each connection has its own library list.)
+2. Open the source you want to compile.
+3. Use <kbd>Ctrl+E</kbd> or <kbd>Cmd+E</kbd> to compile your source.
+4. If you have more than one compile option available to you for the type of source, select the appropriate one.
+5. If you are using `*EVENTF`, the error listing should automatically load in the PROBLEMS tab.
